@@ -57,6 +57,7 @@ public final class VibeChatPlugin extends JavaPlugin implements Listener, TabExe
     private static final LegacyComponentSerializer LEGACY = LegacyComponentSerializer.legacyAmpersand();
     private static final LegacyComponentSerializer LEGACY_SECTION = LegacyComponentSerializer.legacySection();
     private static final PlainTextComponentSerializer PLAIN = PlainTextComponentSerializer.plainText();
+    private static final Pattern LEGACY_CODE_PATTERN = Pattern.compile("(?i)[&\u00a7]([0-9a-fk-orx]|#[0-9a-f]{6})");
     private static final Pattern LINK_PATTERN = Pattern.compile("(?i)\\b((https?://)?([a-z0-9-]+\\.)+[a-z]{2,}|\\d{1,3}(\\.\\d{1,3}){3})(/\\S*)?");
     private static final Pattern COMMAND_PATTERN = Pattern.compile("(^|\\s)(/[^\\s]+)");
     private static final String TEAM_INVISE = "vc_hidden_names";
@@ -295,7 +296,17 @@ public final class VibeChatPlugin extends JavaPlugin implements Listener, TabExe
             return;
         }
         String label = split[0].toLowerCase(Locale.ROOT);
+        int namespaceEnd = label.indexOf(':');
+        if (namespaceEnd > 0 && Set.of("minecraft", "bukkit", "vibechat").contains(label.substring(0, namespaceEnd))) {
+            label = label.substring(namespaceEnd + 1);
+        }
         String[] args = Arrays.copyOfRange(split, 1, split.length);
+        if (Set.of("me", "teammsg", "tm").contains(label) && isMuted(event.getPlayer())) {
+            event.setCancelled(true);
+            send(event.getPlayer(), msg("muted").replace("{time}", formatMuteTime(event.getPlayer())));
+            play(event.getPlayer(), "sounds.error");
+            return;
+        }
         if (Set.of("vc", "vibechat").contains(label)) {
             event.setCancelled(true);
             commandVc(event.getPlayer(), args);
@@ -388,14 +399,15 @@ public final class VibeChatPlugin extends JavaPlugin implements Listener, TabExe
             publicReply = null;
         }
 
-        if (message.isEmpty()) {
+        String plainMessage = stripColorCodes(message).trim();
+        if (plainMessage.isEmpty()) {
             return;
         }
-        if (!passesModeration(player, message)) {
+        if (!passesModeration(player, plainMessage)) {
             return;
         }
 
-        String formattedMessage = filterBadWords(message);
+        String formattedMessage = prepareMessage(player, message);
         if (chatMode == ChatMode.GLOBAL) {
             sendGlobal(player, formattedMessage, publicReply);
         } else {
@@ -688,11 +700,12 @@ public final class VibeChatPlugin extends JavaPlugin implements Listener, TabExe
         }
 
         String message = rawMessage.trim();
-        if (message.isEmpty() || !passesModeration(sender, message)) {
+        String plainMessage = stripColorCodes(message).trim();
+        if (plainMessage.isEmpty() || !passesModeration(sender, plainMessage)) {
             return false;
         }
 
-        Component component = clanChatComponent(sender, Objects.toString(clanTag, ""), filterBadWords(message));
+        Component component = clanChatComponent(sender, Objects.toString(clanTag, ""), prepareMessage(sender, message));
         Component bedrockComponent = bedrockSafeComponent(component);
         for (Player target : recipients) {
             if (target != null && target.isOnline() && !isIgnoring(target.getUniqueId(), sender.getUniqueId())) {
@@ -739,7 +752,7 @@ public final class VibeChatPlugin extends JavaPlugin implements Listener, TabExe
         if (parts.length > 0) {
             appendDecorated(builder, parts[0], label, global, sender.getName(), publicReply);
         }
-        builder.append(messageComponent(sender, message, global ? ReplyClickMode.GLOBAL : ReplyClickMode.LOCAL));
+        builder.append(messageComponent(sender, message, global ? ReplyClickMode.GLOBAL : ReplyClickMode.LOCAL, canUseColor(sender)));
         if (parts.length > 1) {
             appendDecorated(builder, parts[1], label, global, sender.getName(), publicReply);
         }
@@ -764,7 +777,7 @@ public final class VibeChatPlugin extends JavaPlugin implements Listener, TabExe
         if (parts.length > 0) {
             appendClanDecorated(builder, parts[0], label, sender.getName(), clanTag);
         }
-        builder.append(color("&f" + message));
+        builder.append(playerText(message, canUseColor(sender)));
         if (parts.length > 1) {
             appendClanDecorated(builder, parts[1], label, sender.getName(), clanTag);
         }
@@ -830,14 +843,14 @@ public final class VibeChatPlugin extends JavaPlugin implements Listener, TabExe
                 .hoverEvent(HoverEvent.showText(color(hover)));
     }
 
-    private Component messageComponent(Player sender, String message, ReplyClickMode replyClickMode) {
+    private Component messageComponent(Player sender, String message, ReplyClickMode replyClickMode, boolean allowColor) {
         TextComponent.Builder builder = Component.text();
         Matcher matcher = COMMAND_PATTERN.matcher(message);
         int last = 0;
         while (matcher.find()) {
             String before = message.substring(last, matcher.start(2));
             if (!before.isEmpty()) {
-                builder.append(replyClickMode == ReplyClickMode.NONE ? color("&f" + before) : publicReplyClickable(sender, before, replyClickMode));
+                builder.append(replyClickMode == ReplyClickMode.NONE ? playerText(before, allowColor) : publicReplyClickable(sender, before, replyClickMode, allowColor));
             }
             String command = matcher.group(2);
             builder.append(Component.text(command)
@@ -848,7 +861,7 @@ public final class VibeChatPlugin extends JavaPlugin implements Listener, TabExe
         }
         if (last < message.length()) {
             String tail = message.substring(last);
-            builder.append(replyClickMode == ReplyClickMode.NONE ? color("&f" + tail) : publicReplyClickable(sender, tail, replyClickMode));
+            builder.append(replyClickMode == ReplyClickMode.NONE ? playerText(tail, allowColor) : publicReplyClickable(sender, tail, replyClickMode, allowColor));
         }
         Component base = builder.build();
         if (settings.getBoolean("features.mentions", true)) {
@@ -863,8 +876,8 @@ public final class VibeChatPlugin extends JavaPlugin implements Listener, TabExe
         return base;
     }
 
-    private Component publicReplyClickable(Player sender, String text, ReplyClickMode replyClickMode) {
-        return color("&f" + text)
+    private Component publicReplyClickable(Player sender, String text, ReplyClickMode replyClickMode, boolean allowColor) {
+        return playerText(text, allowColor)
                 .clickEvent(ClickEvent.callback(audience -> runOnPlayer(audience, player -> selectPublicReply(player, sender.getUniqueId().toString(), replyClickMode.name().toLowerCase(Locale.ROOT)))))
                 .hoverEvent(HoverEvent.showText(color(replyClickMode == ReplyClickMode.PRIVATE
                         ? "&eОтветить игроку &f" + sender.getName() + " &eв ЛС"
@@ -889,6 +902,11 @@ public final class VibeChatPlugin extends JavaPlugin implements Listener, TabExe
     }
 
     private void sendPrivate(Player sender, UUID receiverId, String rawMessage) {
+        if (isMuted(sender)) {
+            send(sender, msg("muted").replace("{time}", formatMuteTime(sender)));
+            play(sender, "sounds.error");
+            return;
+        }
         Player receiver = Bukkit.getPlayer(receiverId);
         if (receiverId.equals(sender.getUniqueId())) {
             send(sender, msg("cannot-self"));
@@ -905,10 +923,11 @@ public final class VibeChatPlugin extends JavaPlugin implements Listener, TabExe
             play(sender, "sounds.error");
             return;
         }
-        if (!passesModeration(sender, rawMessage)) {
+        String plainMessage = stripColorCodes(rawMessage).trim();
+        if (plainMessage.isEmpty() || !passesModeration(sender, plainMessage)) {
             return;
         }
-        String message = filterBadWords(rawMessage);
+        String message = prepareMessage(sender, rawMessage);
         OfflinePlayer receiverOffline = Bukkit.getOfflinePlayer(receiverId);
         if (receiver == null) {
             storeOfflineMessage(sender, receiverOffline, message);
@@ -943,13 +962,19 @@ public final class VibeChatPlugin extends JavaPlugin implements Listener, TabExe
             String[] messageParts = parts[1].split(Pattern.quote("__MESSAGE__"), -1);
             builder.append(color(messageParts[0]));
             Player replyTarget = incoming ? sender : receiver;
-            builder.append(messageComponent(replyTarget, message, ReplyClickMode.PRIVATE));
+            builder.append(messageComponent(replyTarget, message, ReplyClickMode.PRIVATE, canUseColor(sender)));
             if (messageParts.length > 1) {
                 builder.append(color(messageParts[1]));
             }
             return builder.build();
         }
-        return color(rendered.replace("__MESSAGE__", message));
+        String[] messageParts = rendered.split(Pattern.quote("__MESSAGE__"), -1);
+        builder.append(color(messageParts[0]));
+        for (int i = 1; i < messageParts.length; i++) {
+            builder.append(playerText(message, canUseColor(sender)));
+            builder.append(color(messageParts[i]));
+        }
+        return builder.build();
     }
 
     private Component playerNameComponent(String playerName) {
@@ -972,6 +997,7 @@ public final class VibeChatPlugin extends JavaPlugin implements Listener, TabExe
         entry.put("sender-id", sender.getUniqueId().toString());
         entry.put("sender-name", sender.getName());
         entry.put("message", message);
+        entry.put("color", canUseColor(sender));
         entry.put("time", System.currentTimeMillis());
         List<Map<?, ?>> updated = new ArrayList<>(messagesForPlayer);
         updated.add(entry);
@@ -1054,8 +1080,14 @@ public final class VibeChatPlugin extends JavaPlugin implements Listener, TabExe
             Object idValue = map.get("sender-id");
             String senderName = senderValue == null ? "Игрок" : String.valueOf(senderValue);
             String message = messageValue == null ? "" : String.valueOf(messageValue);
+            boolean allowColor = Boolean.TRUE.equals(map.get("color"));
             lastSenderId = idValue == null ? null : String.valueOf(idValue);
-            player.sendMessage(color("&d[ЛС] &7от &f" + senderName + " &8➜ &f" + message));
+            player.sendMessage(Component.text()
+                    .append(color("&d[ЛС] &7от &f"))
+                    .append(Component.text(senderName, net.kyori.adventure.text.format.NamedTextColor.WHITE))
+                    .append(color(" &8➜ "))
+                    .append(playerText(message, allowColor))
+                    .build());
         }
         offlineMessages.set(key, remaining.isEmpty() ? null : remaining);
         saveQuietly(offlineMessages, offlineMessagesFile);
@@ -1642,6 +1674,39 @@ public final class VibeChatPlugin extends JavaPlugin implements Listener, TabExe
 
     private Component color(String message) {
         return LEGACY.deserialize(message == null ? "" : message);
+    }
+
+    private boolean canUseColor(Player player) {
+        return player.hasPermission("vibechat.color");
+    }
+
+    private String stripColorCodes(String text) {
+        if (text == null) {
+            return "";
+        }
+        String result = text;
+        String previous;
+        do {
+            previous = result;
+            result = LEGACY_CODE_PATTERN.matcher(result).replaceAll("");
+        } while (!result.equals(previous));
+        return result;
+    }
+
+    private String prepareMessage(Player player, String message) {
+        String plain = stripColorCodes(message).trim();
+        String filtered = filterBadWords(plain);
+        if (canUseColor(player) && filtered.equals(plain)) {
+            return filterBadWords(message);
+        }
+        return filtered;
+    }
+
+    private Component playerText(String text, boolean allowColor) {
+        if (allowColor) {
+            return color("&f" + text);
+        }
+        return Component.text(text, net.kyori.adventure.text.format.NamedTextColor.WHITE);
     }
 
     private String join(String[] args, int start) {
